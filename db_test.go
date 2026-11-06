@@ -72,13 +72,11 @@ func mustCreateTask(t *testing.T, s *Store, owner int64, body string) Task {
 // readPassword reads the raw passwords row, bypassing the Store API.
 func readPassword(t *testing.T, s *Store, ownerID int64) (hash, salt []byte) {
 	t.Helper()
-	err := s.db.QueryRowContext(context.Background(),
-		"SELECT password_hash, salt FROM passwords WHERE owner_id = ?", ownerID,
-	).Scan(&hash, &salt)
+	pass, err := s.getUserPassword(context.Background(), ownerID)
 	if err != nil {
 		t.Fatalf("reading password row: %v", err)
 	}
-	return hash, salt
+	return pass.Hash, pass.Salt
 }
 
 func count(t *testing.T, s *Store, query string, args ...any) int {

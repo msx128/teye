@@ -16,7 +16,7 @@ var (
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id   INTEGER PRIMARY KEY,
-	name TEXT NOT NULL
+	name TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS passwords (
 	owner_id      INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -33,11 +33,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 const q_listUsers = "SELECT id,name FROM users;"
 const q_addUser = "INSERT INTO users (name) VALUES (?) RETURNING id,name;"
 const q_getUser = "SELECT id,name FROM users WHERE id = ?;"
+const q_getUserByName = "SELECT id,name FROM users WHERE name = ?;"
 const q_deleteUser = "DELETE FROM users WHERE id = ?;"
 const q_updateUserName = `UPDATE users SET name = ? WHERE id = ?
 						  RETURNING id,name;`
 const q_addPassword = `INSERT INTO passwords (owner_id,password_hash,salt)
 					   VALUES (?,?,?);`
+const q_getUserPassword = "SELECT owner_id, password_hash, salt FROM passwords WHERE owner_id = ?;"
 const q_deletePassword = "DELETE FROM passwords WHERE owner_id = ?;"
 const q_addTask = `INSERT INTO tasks (owner_id,body) VALUES (?,?)
 				   RETURNING id,owner_id,body,state;`
@@ -59,11 +61,13 @@ type Store struct {
 	st_addUser        *sql.Stmt
 	st_listUsers      *sql.Stmt
 	st_getUser        *sql.Stmt
+	st_getUserByName  *sql.Stmt
 	st_deleteUser     *sql.Stmt
 	st_updateUserName *sql.Stmt
 
-	st_addPassword    *sql.Stmt
-	st_deletePassword *sql.Stmt
+	st_addPassword     *sql.Stmt
+	st_getUserPassword *sql.Stmt
+	st_deletePassword  *sql.Stmt
 
 	st_addTask            *sql.Stmt
 	st_deleteTask         *sql.Stmt
@@ -109,10 +113,12 @@ func NewStore(ctx context.Context, path string) (*Store, error) {
 		{db, &store.st_listUsers, q_listUsers},
 		{db, &store.st_addUser, q_addUser},
 		{db, &store.st_getUser, q_getUser},
+		{db, &store.st_getUserByName, q_getUserByName},
 		{db, &store.st_deleteUser, q_deleteUser},
 		{db, &store.st_updateUserName, q_updateUserName},
 
 		{db, &store.st_addPassword, q_addPassword},
+		{db, &store.st_getUserPassword, q_getUserPassword},
 		{db, &store.st_deletePassword, q_deletePassword},
 
 		{db, &store.st_addTask, q_addTask},
@@ -153,6 +159,14 @@ func (s *Store) AddUser(ctx context.Context, name string, password_hash, salt []
 func (s *Store) GetUser(ctx context.Context, id int64) (User, error) {
 	var u User
 	if err := s.st_getUser.QueryRowContext(ctx, id).Scan(&u.ID, &u.Name); err != nil {
+		return User{}, ErrNotFound
+	}
+	return u, nil
+}
+
+func (s *Store) GetUserByName(ctx context.Context, name string) (User, error) {
+	var u User
+	if err := s.st_getUserByName.QueryRowContext(ctx, name).Scan(&u.ID, &u.Name); err != nil {
 		return User{}, ErrNotFound
 	}
 	return u, nil
@@ -225,6 +239,20 @@ func (s *Store) deletePassword(ctx context.Context, owner_id int64) error {
 		return fmt.Errorf("deleting password: %w", err)
 	}
 	return nil
+}
+
+type Password struct {
+	OwnerID int64  `json:"owner_id"`
+	Hash    []byte `json:"hash"`
+	Salt    []byte `json:"salt"`
+}
+
+func (s *Store) getUserPassword(ctx context.Context, ownerID int64) (Password, error) {
+	var pass Password
+	if err := s.st_getUserPassword.QueryRowContext(ctx, ownerID).Scan(&pass.OwnerID, &pass.Hash, &pass.Salt); err != nil {
+		return Password{}, ErrNotFound
+	}
+	return pass, nil
 }
 
 type Task struct {
