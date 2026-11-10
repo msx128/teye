@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +13,12 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed all:front/dist
+var frontendFS embed.FS
+
+// idk if embed should be in main and passed
+// or where server stuct located
 
 func main() {
 	if err := run(); err != nil {
@@ -25,10 +33,17 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("creating storage: %w", err)
 	}
-	server := &Server{store, []byte("fhohfewovwe3o432i")}
+	JWTKey := envOr("JWTKEY", "FLJjgksl9842($@$fskfFF)")
+	server := &Server{store, []byte(JWTKey)}
+	sub, err := fs.Sub(frontendFS, "front/dist")
+	if err != nil {
+		return fmt.Errorf("getting static: %w", err)
+	}
+	port := envOr("PORT", "8989")
+	addr := "localhost:" + port
 	srv := http.Server{
-		Addr:         "localhost:8989",
-		Handler:      server.GetHandler(),
+		Addr:         addr,
+		Handler:      server.GetHandler(sub),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
@@ -37,9 +52,17 @@ func run() error {
 			log.Fatal(err)
 		}
 	}()
-	fmt.Println("server started")
+	fmt.Println("server started on", port)
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+func envOr(key, def string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
+	}
+	return val
 }

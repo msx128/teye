@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
@@ -15,12 +17,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const TOKEN_EXPIRATION_TIME = 24 * time.Hour
+
 type Server struct {
 	Store  *Store
 	JWTKey []byte
 }
 
-func (s *Server) GetHandler() http.Handler {
+func (s *Server) GetHandler(static fs.FS) http.Handler {
 	protected := http.NewServeMux()
 	protected.HandleFunc("GET /tasks", s.listTasks)
 	protected.HandleFunc("POST /tasks", s.createTask)
@@ -28,11 +32,27 @@ func (s *Server) GetHandler() http.Handler {
 	protected.HandleFunc("POST /tasks/{id}", s.switchTask)
 	protected.HandleFunc("PATCH /tasks/{id}", s.changeTask)
 	protected.HandleFunc("DELETE /tasks/{id}", s.deleteTask)
+	protected.HandleFunc("GET /me", s.UserFromAuth)
 	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServerFS(static))
 	mux.Handle("/api/", http.StripPrefix("/api", s.auth(protected)))
-	mux.HandleFunc("POST /register", s.register)
-	mux.HandleFunc("POST /login", s.login)
+	mux.HandleFunc("POST /auth/register", s.register)
+	mux.HandleFunc("POST /auth/loginAPI", s.loginWriteToken)
+	mux.HandleFunc("POST /auth/login", s.loginSendCookie)
 	return mux
+}
+
+func (s *Server) UserFromAuth(w http.ResponseWriter, r *http.Request) {
+	userID := getUserID(r)
+	user, err := s.Store.GetUser(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := json.MarshalWrite(w, user); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -169,11 +189,22 @@ type ctxKey struct{}
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok {
-			log.Print("no token")
+		JWTCookie, err := r.Cookie("jwt")
+		if err != nil && !errors.Is(err, http.ErrNoCookie) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
+		}
+		var tok string
+		var ok bool
+		if errors.Is(err, http.ErrNoCookie) {
+			tok, ok = strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if !ok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		if tok == "" && JWTCookie != nil {
+			tok = JWTCookie.Value
 		}
 		userID, err := s.parseToken(tok)
 		if err != nil {
@@ -245,7 +276,7 @@ func (s *Server) authenticate(ctx context.Context, u UserJSON) (User, error) {
 	return user, nil
 }
 
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+func (s *Server) loginWriteToken(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024*5)
 	user := UserJSON{}
 	if err := json.UnmarshalRead(r.Body, &user, json.RejectUnknownMembers(true)); err != nil {
@@ -268,12 +299,41 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+func (s *Server) loginSendCookie(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024*5)
+	user := UserJSON{}
+	if err := json.UnmarshalRead(r.Body, &user, json.RejectUnknownMembers(true)); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	u, err := s.authenticate(r.Context(), user)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	userID := strconv.FormatInt(u.ID, 10)
+	tok, err := s.issueToken(userID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	tokCookie := &http.Cookie{
+		Name:     "jwt",
+		Value:    tok,
+		Expires:  time.Now().Add(TOKEN_EXPIRATION_TIME), // this should be the same as token
+		HttpOnly: true,
+		SameSite: http.SameSiteDefaultMode,
+		Secure:   false, // change this with https
+		Path:     "/",
+	}
+	http.SetCookie(w, tokCookie)
+}
 
 func (s *Server) issueToken(ID string) (string, error) {
 	claims := jwt.RegisteredClaims{
 		Subject:   ID,
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(TOKEN_EXPIRATION_TIME)),
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.JWTKey)
 }
